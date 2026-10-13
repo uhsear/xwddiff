@@ -36,10 +36,12 @@ from __future__ import print_function
 import argparse
 import csv
 import io
+import math
 import os
 import shutil
 import sys
 import tempfile
+import unicodedata
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 
@@ -66,11 +68,12 @@ R_DS_TYPE = ("A dataset's type is set when it is created, and no tool "
              "converts one in place.")
 R_MOVED = ("Its catalog path changes, so every reference to the old path "
            "breaks.")
-R_FIXED = ("Esri sets this when the feature class is created, and xwddiff "
-           "knows no tool that changes it in place.")
-R_SR = ("The spatial reference is set when the feature class is created. "
-        "Define Projection only relabels it without moving a coordinate, so "
-        "a real change means Project into a new feature class.")
+R_FIXED = ("A feature class holds one kind of geometry, and xwddiff knows no "
+           "tool that changes this in place.")
+R_SR = ("The x,y resolution and tolerance are defined when the feature class "
+        "is created. Define Projection only relabels the coordinate system "
+        "without moving a coordinate, so a real change means Project into a "
+        "new feature class.")
 R_LABEL = "Only the label people read changes."
 R_FIELD_REMOVED = ("Its values are gone, and every reader or writer that "
                    "names it fails.")
@@ -151,8 +154,10 @@ class Change(object):
         self.detail = detail
 
     def line(self):
-        return "%-8s  %s %s: %s" % (self.severity, self.kind, self.path,
-                                    self.detail)
+        # Names come from the documents. A line break in one must not forge a
+        # report line, so control characters print as escapes.
+        return "%-8s  %s %s: %s" % (self.severity, self.kind,
+                                    plain(self.path), plain(self.detail))
 
 
 class Dataset(object):
@@ -244,10 +249,12 @@ def merged_keys(old, new):
 
 
 def as_number(value):
+    """The finite number a text holds, or None. nan and inf are not bounds."""
     try:
-        return float(value)
+        number = float(value)
     except ValueError:
         return None
+    return number if math.isfinite(number) else None
 
 
 def same_value(a, b):
@@ -256,6 +263,13 @@ def same_value(a, b):
         return True
     x, y = as_number(a), as_number(b)
     return x is not None and y is not None and x == y
+
+
+def plain(value):
+    """The text with control and line-separator characters as escapes."""
+    return "".join(
+        repr(c)[1:-1] if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c
+        for c in value)
 
 
 def show(value):
@@ -280,8 +294,17 @@ def refuse_doctype(data):
     parser.StartDoctypeDeclHandler = stop
     try:
         parser.Parse(data, True)
-    except expat.ExpatError as exc:
+    except (expat.ExpatError, LookupError) as exc:
+        # LookupError: the declaration names an encoding Python does not know.
         raise Unreadable("not well-formed XML: %s" % exc)
+
+
+def nothing_to_compare(old, new):
+    """True when neither Workspace holds a dataset or a domain.
+
+    Two empty documents would diff clean, but only because nothing was read.
+    """
+    return not (old.datasets or old.domains or new.datasets or new.domains)
 
 
 def unqualified(name):
@@ -296,7 +319,12 @@ def load(data):
                          "Workspace Document compresses its output. Extract "
                          "the .xml inside it and diff that.")
     refuse_doctype(data)
-    root = ET.fromstring(data)
+    try:
+        root = ET.fromstring(data)
+    except (ET.ParseError, LookupError) as exc:
+        # Expat without namespaces accepts what ElementTree rejects, such as
+        # xsi:type with no xmlns:xsi declared.
+        raise Unreadable("not well-formed XML: %s" % exc)
     if local(root.tag) != "Workspace":
         raise Unreadable("the root element is <%s>, not <Workspace>"
                          % local(root.tag))
@@ -372,7 +400,7 @@ def same_type_leaf(name, severity, reason):
 
 def length_rule(path, kind, a, b, out):
     old, new = text(a, "Length"), text(b, "Length")
-    if old == new or text(a, "Type") != text(b, "Type"):
+    if same_value(old, new) or text(a, "Type") != text(b, "Type"):
         return
     detail = "Length %s -> %s. " % (show(old), show(new))
     if (text(b, "Type") not in TEXT_TYPES or as_number(old) is None
@@ -386,7 +414,7 @@ def length_rule(path, kind, a, b, out):
 
 def nullable_rule(path, kind, a, b, out):
     old, new = text(a, "IsNullable"), text(b, "IsNullable")
-    if old == new:
+    if old.lower() == new.lower():
         return
     why = R_NULL_LOOSEN if new.lower() == "true" else R_NULL_TIGHTEN
     out.append(Change(BREAKING, kind, path, "IsNullable %s -> %s. %s"
@@ -866,7 +894,19 @@ def swap(doc, old, new):
 # ------------------------------------------------------------------ self-test
 
 def self_test():
-    """Assertions over the decision core and the CLI. No network, no arcpy."""
+    """Run the assertions in a temporary directory that is always removed."""
+    tmp = tempfile.mkdtemp(prefix="xwddiff-")
+    try:
+        return _assertions(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _assertions(tmp):
+    """Assertions over the decision core and the CLI. No network, no arcpy.
+
+    tmp is the only place they write, and self_test() removes it.
+    """
     passed = [0]
     failed = []
 
@@ -922,6 +962,10 @@ def self_test():
     check(only(loosen, BREAKING, "Inspections.RESULT", "looks wider"),
           "a NOT NULL field that becomes nullable is BREAKING, not WIDENING"
           "  <-- pinned defect")
+    check(only(field_swap(F_RESULT, name="RESULT", ftype="esriFieldTypeString",
+                          length="10", nullable="True"), BREAKING,
+               "looks wider"),
+          "a NOT NULL field that becomes nullable True reads as wider too")
     tighten = field_swap(F_FACILITYID, name="FACILITYID",
                          ftype="esriFieldTypeString", length="20",
                          nullable="false")
@@ -1013,6 +1057,15 @@ def self_test():
     bare = load(b"<Workspace><WorkspaceDefinition/></Workspace>")
     check(bare.datasets == {} and bare.domains == {},
           "a document with no datasets and no domains loads empty")
+    check(nothing_to_compare(bare, bare) and not nothing_to_compare(bare, ws),
+          "two empty workspaces are nothing to compare, and one is not")
+    raises(lambda: load(b"<Workspace><WorkspaceDefinition><A xsi:type='x'/>"
+                        b"</WorkspaceDefinition></Workspace>"), Unreadable,
+           "an undeclared namespace prefix is unreadable, not a traceback"
+           "  <-- pinned defect", ("not well-formed",))
+    raises(lambda: load(b"<?xml version='1.0' encoding='bogus'?><Workspace/>"),
+           Unreadable, "an encoding Python does not know is unreadable"
+           "  <-- pinned defect", ("not well-formed",))
 
     # ---- datasets
     no_table = swap(base, base[base.index("<DataElement xsi:type='esri:DETable'>"):
@@ -1086,6 +1139,49 @@ def self_test():
           and "HydrantInspections" in found[0].line(),
           "a changed relationship class is BREAKING as unclassified")
 
+    check(only(swap(base, "<FeatureType>esriFTSimple</FeatureType>",
+                    "<FeatureType>esriFTAnnotation</FeatureType>"), BREAKING,
+               "FeatureType", "no tool that changes"),
+          "a changed feature type is BREAKING")
+    check(only(swap(base, "<HasM>false</HasM><HasZ>false</HasZ><HasSpatialIndex>",
+                    "<HasM>true</HasM><HasZ>false</HasZ><HasSpatialIndex>"),
+               BREAKING, "HasM", "no tool that changes"),
+          "a feature class that gains M values is BREAKING")
+    check(only(swap(base, "<DatasetType>esriDTTable</DatasetType>",
+                    "<DatasetType>esriDTFeatureClass</DatasetType>"), BREAKING,
+               "DatasetType", "no tool converts"),
+          "a dataset type that changes under one xsi:type is BREAKING")
+    check(only(swap(base, "<ModelName/>", "<ModelName>HYD</ModelName>"),
+               COSMETIC, "ModelName"),
+          "a dataset model name change is COSMETIC")
+    for label, old_xml, new_xml in (
+            ("CatalogPath", "<CatalogPath>/FD=Water/FC=Hydrants</CatalogPath>",
+             "<CatalogPath>/FD=Other/FC=Hydrants</CatalogPath>"),
+            ("ConfigurationKeyword", "<ConfigurationKeyword/>",
+             "<ConfigurationKeyword>DEFAULTS</ConfigurationKeyword>"),
+            ("Versioned", "<Versioned>false</Versioned>",
+             "<Versioned>true</Versioned>"),
+            ("CanVersion", "<CanVersion>false</CanVersion>",
+             "<CanVersion>true</CanVersion>"),
+            ("HasGlobalID", "<HasGlobalID>false</HasGlobalID>",
+             "<HasGlobalID>true</HasGlobalID>"),
+            ("GlobalIDFieldName", "<GlobalIDFieldName/>",
+             "<GlobalIDFieldName>GlobalID</GlobalIDFieldName>"),
+            ("RelationshipClassNames", "<HasGlobalID>",
+             "<RelationshipClassNames><Name>HydrantInspections</Name>"
+             "</RelationshipClassNames><HasGlobalID>")):
+        check(changes(swap(base, old_xml, new_xml)) == [],
+              "a changed %s changes nothing  <-- pinned defect" % label)
+    ext_one = swap(base,
+                   "<PropertyArray xsi:type='esri:ArrayOfPropertySetProperty'/>",
+                   "<PropertyArray><PropertySetProperty><Key>k</Key>"
+                   "<Value>1</Value></PropertySetProperty></PropertyArray>")
+    found = changes(ext_one.replace("<Value>1<", "<Value>2<"), ext_one)
+    check(len(found) == 1 and found[0].severity == BREAKING
+          and "<ExtensionProperties> changed" in found[0].detail,
+          "a change two levels inside an element with no rule is BREAKING"
+          "  <-- pinned defect")
+
     # ---- spatial reference
     def sr(old, new):
         return base.replace(SR_FT, SR_FT.replace(old, new))
@@ -1099,6 +1195,14 @@ def self_test():
     check(len(found) == 2 and "XYTolerance" in found[0].detail
           and found[0].severity == BREAKING,
           "a new XY tolerance is BREAKING")
+    for leaf, old_v, new_v in (("XOrigin", "-1000", "-2000"),
+                               ("YOrigin", "-1000", "-3000"),
+                               ("XYScale", "10000", "20000")):
+        found = changes(sr("<%s>%s<" % (leaf, old_v),
+                           "<%s>%s<" % (leaf, new_v)))
+        check(len(found) == 2 and all(c.severity == BREAKING for c in found)
+              and all(leaf in c.detail for c in found),
+              "a new %s is BREAKING" % leaf)
     check(changes(sr("Synthetic_Grid_Feet", "Synthetic_Grid_Feet_v2")) == [],
           "one WKID spelled with other WKT changes nothing")
     check(changes(sr("<XYScale>10000</XYScale>",
@@ -1143,6 +1247,27 @@ def self_test():
     check(only(field_swap(F_NOTES, name="NOTES", ftype="esriFieldTypeString",
                           length="30", alias="Notes"), BREAKING, "shortens"),
           "a text field shortened is BREAKING")
+    blob_50 = swap(base, F_NOTES, _field("NOTES", "esriFieldTypeBlob", "50"))
+    blob_90 = swap(base, F_NOTES, _field("NOTES", "esriFieldTypeBlob", "90"))
+    found = changes(blob_90, blob_50)
+    check(len(found) == 1 and found[0].severity == WIDENING
+          and "lengthen" in found[0].detail,
+          "a blob field lengthened is WIDENING")
+    found = changes(blob_50, blob_90)
+    check(len(found) == 1 and found[0].severity == BREAKING
+          and "shortens" in found[0].detail,
+          "a blob field shortened is BREAKING")
+    check(changes(field_swap(F_NOTES, name="NOTES", ftype="esriFieldTypeString",
+                             length="50.0", alias="Notes")) == [],
+          "a length of 50.0 is the length 50, not a shortening"
+          "  <-- pinned defect")
+    check(only(field_swap(F_NOTES, name="NOTES", ftype="esriFieldTypeString",
+                          length="inf", alias="Notes"), BREAKING,
+               "text or blob"),
+          "a length of inf is BREAKING, not a lengthening  <-- pinned defect")
+    check(changes(swap(base, F_FACILITYID, F_FACILITYID.replace(
+        "<IsNullable>true", "<IsNullable>True"))) == [],
+          "IsNullable True and true are one value  <-- pinned defect")
     check(only(field_swap(F_KIND, name="KIND", ftype="esriFieldTypeSmallInteger",
                           length="4"), BREAKING, "text or blob"),
           "a numeric field's length changing alone is BREAKING")
@@ -1155,7 +1280,8 @@ def self_test():
                "precision or scale"),
           "a precision change is BREAKING")
     check(only(swap(base, F_FACILITYID, F_FACILITYID.replace(
-        "<Scale>0</Scale>", "<Scale>2</Scale>")), BREAKING, "Scale"),
+        "<Scale>0</Scale>", "<Scale>2</Scale>")), BREAKING, "Scale",
+               "no precision or scale parameter"),
           "a scale change is BREAKING")
     check(only(field_swap(F_NOTES, name="NOTES", ftype="esriFieldTypeString",
                           length="50", alias="Remarks"), COSMETIC, "AliasName"),
@@ -1170,7 +1296,7 @@ def self_test():
           "a default value added is WIDENING")
     check(only(swap(base, F_INSPECTED, F_INSPECTED.replace(
         "</Field>", "<Required>true</Required></Field>")), BREAKING,
-               "Required"),
+               "Required", "no parameter that changes it"),
           "a field that becomes required is BREAKING")
     check(only(swap(base, F_INSPECTED, F_INSPECTED.replace(
         "</Field>", "<Editable>false</Editable></Field>")), BREAKING,
@@ -1218,6 +1344,16 @@ def self_test():
     check(len(found) == 2 and found[0].severity == BREAKING
           and "added as UNIQUE" in found[0].detail,
           "a unique index added is BREAKING")
+    idx_pair = (IDX_FACILITY.replace("IDX_FACILITYID", "IDX_PAIR").replace(
+        "</FieldArray>", "<Field xsi:type='esri:Field'><Name>STATUS</Name>"
+        "</Field></FieldArray>"))
+    check(only(swap(base, IDX_FACILITY, IDX_FACILITY + idx_pair), WIDENING,
+               "index(FACILITYID,STATUS)", "added"),
+          "an index over two fields is one index, named by both")
+    check(only(swap(base, IDX_FACILITY, IDX_FACILITY + idx_pair.replace(
+        "<IsUnique>false", "<IsUnique>true")), BREAKING,
+               "index(FACILITYID,STATUS)", "UNIQUE"),
+          "and a unique one over two fields is BREAKING")
     check(changes(swap(base, "R7_SDE_ROWID_UK", "R93_SDE_ROWID_UK")) == [],
           "an index renamed by another database's registration number "
           "changes nothing  <-- pinned defect")
@@ -1303,6 +1439,20 @@ def self_test():
     check(only(bound("<SplitPolicy>esriSPTDefaultValue",
                      "<SplitPolicy>esriSPTDuplicate"), WIDENING, "SplitPolicy"),
           "a split policy change is WIDENING")
+    check(only(bound("<MergePolicy>esriMPTDefaultValue",
+                     "<MergePolicy>esriMPTSumValues"), WIDENING, "MergePolicy"),
+          "a merge policy change is WIDENING")
+    for word in ("nan", "inf"):
+        check(only(bound(">200</MaxValue>", ">%s</MaxValue>" % word), BREAKING,
+                   "no rule"),
+              "a range bound of %s is BREAKING, not WIDENING  <-- pinned "
+              "defect" % word)
+    inf_default = swap(base, F_NOTES, F_NOTES.replace(
+        "</Field>", "<DefaultValue>inf</DefaultValue></Field>"))
+    found = changes(inf_default.replace(">inf<", ">Infinity<"), inf_default)
+    check(len(found) == 1 and found[0].severity == WIDENING,
+          "a default of inf and one of Infinity are two defaults, not a "
+          "number  <-- pinned defect")
     check(only(bound("<Owner/>", "<Owner>gisowner</Owner>"), COSMETIC, "Owner"),
           "a domain owner change is COSMETIC")
     check(only(bound("psi</Description>", "PSI</Description>"), COSMETIC,
@@ -1332,8 +1482,6 @@ def self_test():
           "COSMETIC as the worst change exits 0")
 
     # ---- the CLI, against real files
-    tmp = tempfile.mkdtemp(prefix="xwddiff-")
-
     def tmpfile(name, body):
         path = os.path.join(tmp, name)
         with open(path, "wb") as handle:
@@ -1372,6 +1520,36 @@ def self_test():
           "the CLI exits 4 when WIDENING is the worst change")
     check(run_cli([before, after_cosm])[0] == 0,
           "the CLI exits 0 when only COSMETIC changes")
+    code, out, err = run_cli([before, after_break])
+    check("Check only" not in out and "wrote" not in out,
+          "a run with no --out says nothing about writing  <-- pinned defect")
+    empty = tmpfile("empty.xml", "<Workspace><WorkspaceDefinition/></Workspace>")
+    code, out, err = run_cli([empty, empty])
+    check(code == 2 and "nothing was compared" in err
+          and "IDENTICAL" not in out,
+          "two documents with no dataset and no domain exit 2, not IDENTICAL"
+          "  <-- pinned defect")
+    check(run_cli([before, empty])[0] == 1,
+          "a full document against an empty one is every dataset removed")
+    code, out, err = run_cli([before, tmpfile(
+        "prefix.xml", "<Workspace><WorkspaceDefinition><A xsi:type='x'/>"
+        "</WorkspaceDefinition></Workspace>")])
+    check(code == 2 and "not well-formed" in err,
+          "the CLI exits 2 on an undeclared prefix, not 1  <-- pinned defect")
+    deep = swap(base, "<ModelName/>",
+                "<ModelName/>" + "<D>" * 1500 + "</D>" * 1500)
+    code, out, err = run_cli([tmpfile("deep.xml", deep), tmpfile(
+        "deep2.xml", deep.replace("<D>", "<D k='1'>", 1))])
+    check(code == 2 and "nested too deeply" in err,
+          "a document nested past the recursion limit exits 2, not 1"
+          "  <-- pinned defect")
+    code, out, err = run_cli([before, after_break, "--out", before, "--apply"])
+    with open(before, "rb") as handle:
+        kept = handle.read()
+    check(code == 64 and "input documents" in err
+          and kept == base.encode("utf-8"),
+          "--out naming an input document is refused and the input is kept"
+          "  <-- pinned defect")
     code, out, err = run_cli([before, after_twin, "--out", out_csv,
                               "--apply"])
     check(code == 3 and "REFUSED" in out and "VERDICT: REFUSED" in out,
@@ -1389,6 +1567,48 @@ def self_test():
     check(code == 1 and len(written) == 3
           and [r["severity"] for r in written] == list(SEVERITIES),
           "--out with --apply writes one row per change, worst first")
+    every_kind = swap(base, F_NOTES, "")
+    every_kind = swap(every_kind, IDX_FACILITY, "")
+    every_kind = swap(every_kind, "Dry barrel", "Dry-barrel")
+    every_kind = swap(every_kind, DOM_PRESSURE, "")
+    every_kind = swap(every_kind, "<AliasName>Hydrants</AliasName>",
+                      "<AliasName>Fire hydrants</AliasName>")
+    check(sorted(c.kind for c in changes(every_kind)) == [
+        "dataset", "domain", "field", "index", "subtype"],
+          "each kind of change is named: dataset, field, index, subtype, domain")
+    formula = swap(base, "<Name>Inspections</Name>", "<Name>=cmd</Name>")
+    formula_csv = os.path.join(tmp, "formula.csv")
+    code, out, err = run_cli([tmpfile("f.xml", formula), before, "--out",
+                              formula_csv, "--apply"])
+    with open(formula_csv, newline="", encoding="utf-8") as handle:
+        cells = list(csv.DictReader(handle))
+    check(code == 1 and cells[0]["path"] == "'=cmd",
+          "a name that starts with = is written with a leading quote, so a "
+          "spreadsheet does not run it  <-- pinned defect")
+    check(cell("Hydrants") == "Hydrants" and cell("") == "",
+          "and an ordinary cell is written as it is")
+    line_break = swap(base, "<AliasName>Hydrants</AliasName>",
+                      "<AliasName>x\nVERDICT: IDENTICAL</AliasName>")
+    report = describe(changes(line_break))
+    check(len(report) == 3 and "\\n" in report[0]
+          and report[-1].startswith("VERDICT: COSMETIC"),
+          "a line break in an alias prints as a backslash n and forges no "
+          "report line  <-- pinned defect")
+    wide_text = swap(base, "<AliasName>Hydrants</AliasName>",
+                     u"<AliasName>Hydrants \u2265 2in \u6c34</AliasName>")
+    wide_path = tmpfile("wide_text.xml", wide_text)
+    raw = io.BytesIO()
+    ascii_out = io.TextIOWrapper(raw, encoding="ascii")
+    old_out = sys.stdout
+    sys.stdout = ascii_out
+    try:
+        code = main([before, wide_path])
+        ascii_out.flush()
+    finally:
+        sys.stdout = old_out
+    check(code == 0 and b"\\u2265" in raw.getvalue(),
+          "a name the console cannot encode prints as an escape, and a "
+          "COSMETIC run still exits 0  <-- pinned defect")
     code, out, err = run_cli([before, after_break, "--out", tmp, "--apply"])
     check(code == 2 and "could not write" in err,
           "an --out that cannot be written exits 2, not the gate's 1")
@@ -1451,8 +1671,6 @@ def self_test():
     raises(lambda: swap("aa", "a", "b"), AssertionError,
            "the fixture refuses a fragment that is not unique")
 
-    shutil.rmtree(tmp, ignore_errors=True)
-
     print("-" * 68)
     return summary(passed[0] + len(failed), failed)
 
@@ -1505,6 +1723,13 @@ def read_document(path):
         return load(handle.read())
 
 
+def cell(value):
+    """A CSV cell that a spreadsheet will not run as a formula."""
+    if value[:1] in tuple("=+-@" + chr(9) + chr(13)):
+        return "'" + value
+    return value
+
+
 def write_changes(path, changes):
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -1512,11 +1737,29 @@ def write_changes(path, changes):
         for severity in SEVERITIES:
             for c in changes:
                 if c.severity == severity:
-                    writer.writerow([c.severity, c.kind, c.path, c.detail])
+                    writer.writerow([c.severity, c.kind, cell(c.path),
+                                     cell(c.detail)])
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(
+        os.path.realpath(b))
+
+
+def safe_streams():
+    """Print what the console cannot encode as escapes, not as a traceback.
+
+    A traceback exits 1, which a job reads as BREAKING.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(errors="backslashreplace")
 
 
 def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
+    safe_streams()
 
     if args.self_test:
         return self_test()
@@ -1528,10 +1771,24 @@ def main(argv=None):
     if args.apply and not args.out:
         print("error: --apply needs --out.", file=sys.stderr)
         return EXIT_USAGE
+    if args.out and (same_path(args.out, args.old)
+                     or same_path(args.out, args.new)):
+        print("error: --out names one of the two input documents. Name a new "
+              "file.", file=sys.stderr)
+        return EXIT_USAGE
 
     print("xwddiff: %s -> %s" % (args.old, args.new))
     try:
-        found = diff(read_document(args.old), read_document(args.new))
+        old, new = read_document(args.old), read_document(args.new)
+        if nothing_to_compare(old, new):
+            raise Unreadable("neither document holds a dataset or a domain "
+                             "under <WorkspaceDefinition>, so nothing was "
+                             "compared")
+        found = diff(old, new)
+    except RecursionError:
+        print("error: a document is nested too deeply to compare.",
+              file=sys.stderr)
+        return EXIT_UNREADABLE
     except Ambiguous as exc:
         print("REFUSED   %s. A name that stands for two things cannot be "
               "diffed, so nothing was compared." % exc)

@@ -29,47 +29,40 @@ $ python xwddiff.py --self-test
 xwddiff self-test: no geodatabase, no network, no arcpy
 --------------------------------------------------------------------
 PASS  a short integer widened to a long integer is BREAKING, because Alter Field changes a type only on an empty table  <-- pinned defect
-PASS  and the length that moves with the type is not reported again
-PASS  a NOT NULL field that becomes nullable is BREAKING, not WIDENING  <-- pinned defect
-PASS  a nullable field that becomes NOT NULL is BREAKING
 ...
-PASS  the fields of an index are not read as the table's fields  <-- pinned defect
+PASS  a NOT NULL field that becomes nullable is BREAKING, not WIDENING  <-- pinned defect
 ...
 PASS  two datasets with one unqualified name refuse the document  <-- pinned defect
-PASS  a dataset with no name refuses the document
-PASS  a field named twice in one table refuses the diff instead of keeping the last one  <-- pinned defect
 ...
 PASS  a DOCTYPE is refused before any entity expands  <-- pinned defect
-PASS  a DOCTYPE in a UTF-16 file is refused too  <-- pinned defect
 ...
-PASS  a new extent, DSID, grid size, spatial index flag or metadata changes nothing  <-- pinned defect
-PASS  a default of 1 typed xs:int instead of xs:short changes nothing
-PASS  an attribute that is not xsi:type counts in a comparison
+PASS  an undeclared namespace prefix is unreadable, not a traceback  <-- pinned defect
+...
 PASS  a dataset element with no rule that differs is BREAKING, never COSMETIC  <-- pinned defect
-PASS  a changed relationship class is BREAKING as unclassified
+...
+PASS  a changed CatalogPath changes nothing  <-- pinned defect
 ...
 PASS  a NOT NULL field added to an existing table is BREAKING  <-- pinned defect
-PASS  a GlobalID field added is WIDENING, though it is NOT NULL
-PASS  a text field lengthened is WIDENING
-PASS  a text field shortened is BREAKING
 ...
-PASS  an index renamed by another database's registration number changes nothing  <-- pinned defect
+PASS  a length of 50.0 is the length 50, not a shortening  <-- pinned defect
 ...
-PASS  an ambiguous document exits 3, not the 1 of a breaking change
-PASS  and a refused run writes nothing, even with --apply  <-- pinned defect
-PASS  --out without --apply writes nothing at all  <-- pinned defect
+PASS  a range bound of nan is BREAKING, not WIDENING  <-- pinned defect
+...
+PASS  two documents with no dataset and no domain exit 2, not IDENTICAL  <-- pinned defect
+...
+PASS  --out naming an input document is refused and the input is kept  <-- pinned defect
+...
+PASS  a name the console cannot encode prints as an escape, and a COSMETIC run still exits 0  <-- pinned defect
 ...
 PASS  a unique prefix --ap of --apply is refused by the parser  <-- pinned defect
-PASS  a prefix of --self-test is refused too
-PASS  main with no argv reads the arguments after the program name
-PASS  a failed run prints the count and every failed label, and exits 1
+...
 PASS  check() and raises() really do record a failure  <-- pinned defect
-PASS  the fixture refuses a fragment that is not unique
+...
 --------------------------------------------------------------------
-127 assertions, 0 failed
+168 assertions, 0 failed
 ```
 
-The full run prints all 127 assertions. The `...` lines above are where this block is cut.
+The full run prints all 168 assertions. The `...` lines above are where this block is cut.
 
 ## The existing alternative
 
@@ -85,12 +78,21 @@ not put a severity on each change, and its exit code does not tell a lengthened 
 retyped one. That severity class, and an exit code per class, is the whole of this tool. Both
 statements come from GDBStudio's README. I have not run GDBStudio.
 
+Two older tools compare schemas too. I found them with `gh search repos` on 2026-10-13, and I
+have not run either. [cmac3095/gdb-diff-tool](https://github.com/cmac3095/gdb-diff-tool) is a
+2014 Python 2 script with an XSLT stylesheet that reports the differences between two geodatabase
+schemas. It has no licence file and no severity class.
+[Zekiah/ArcGISCompare](https://github.com/Zekiah/ArcGISCompare) is an ArcObjects desktop
+application that compares two file geodatabases by feature class. It needs an ArcGIS Desktop or
+ArcGIS Engine licence. It reports differences and does not class them.
+
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network and no
-database. It reads two files and writes nothing unless you ask.
+database. It reads two files and writes nothing unless you ask. The one exception is
+`--self-test`, which writes small fixture files into a temporary directory and removes it.
 
-The self-test prints 127 assertions on every interpreter it has run on: Windows Python 3.13.2,
+The self-test prints 168 assertions on every interpreter it has run on: Windows Python 3.13.2,
 Windows Python 3.9.25 and Ubuntu Python 3.12.3. All three runs used `-W error`.
 
 ```
@@ -112,9 +114,9 @@ python xwddiff.py before.xml after.xml --out changes.csv --apply
 |---|---|---|
 | `OLD` | none | The document the target geodatabase matches today. Required unless `--self-test`. |
 | `NEW` | none | The document the target is meant to match next. Required unless `--self-test`. |
-| `--out` | off | Write every change to this CSV. Needs `--apply`. |
+| `--out` | off | Write every change to this CSV. Needs `--apply`. It may not name `OLD` or `NEW`. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
-| `--self-test` | off | Run the assertions and exit. |
+| `--self-test` | off | Run the assertions and exit. Takes no other flag, and ignores any that you add. |
 
 The parser refuses abbreviations, so `--ap` is an error and not `--apply`.
 
@@ -148,8 +150,9 @@ VERDICT: WIDENING. Every change applies in place, and existing rows and readers 
 ```
 
 An enterprise geodatabase writes a dataset name as `database.owner.name`, and a file geodatabase
-writes only the name. The tool removes the database and owner before it matches two datasets. So
-a production export and a development export compare on the dataset itself:
+writes only the name. The tool removes the database and owner before it matches two datasets. In
+`cosmetic.xml` the dataset is named `proddb.gisowner.Hydrants`, and in `before.xml` it is named
+`Hydrants`. The two compare on the dataset itself:
 
 ```
 $ python xwddiff.py before.xml cosmetic.xml
@@ -169,17 +172,34 @@ REFUSED   two datasets are both named 'Hydrants' once the database and owner are
 VERDICT: REFUSED
 ```
 
+A document that holds no dataset and no domain under `<WorkspaceDefinition>` has nothing to
+compare. Two of them would diff clean only because nothing was read, so the tool exits 2 instead:
+
+```
+$ python xwddiff.py empty.xml empty.xml
+xwddiff: empty.xml -> empty.xml
+error: neither document holds a dataset or a domain under <WorkspaceDefinition>, so nothing was compared
+```
+
 The same refusal applies to a field named twice in one table, a domain named twice, a coded value
 code used twice, and a subtype code used twice. A dictionary keeps the last of two equal keys,
 which would hide the first one from the diff.
 
 `--out changes.csv` alone prints `Check only. changes.csv was not written. Re-run with --apply.`
 and writes nothing. With `--apply` it writes one row per change, `BREAKING` rows first, under the
-header `severity,kind,path,detail`.
+header `severity,kind,path,detail`. A CSV cell that starts with `=`, `+`, `-`, `@`, a tab or a
+carriage return gets a leading apostrophe, so a spreadsheet does not run it as a formula.
+
+The report prints a control character in a name as an escape, so a line break in an alias cannot
+forge a `VERDICT:` line. It prints a character that the console cannot encode as a backslash
+escape, such as `\u6c34`, and does not stop.
 
 ## The rules
 
-Each rule below is exercised by at least one self-test assertion. The Esri behaviour each one
+Each rule below is exercised by at least one self-test assertion. To check that, I changed the
+severity of each rule in the tables, and removed each name from the ignore lists, one change at a
+time: 37 changes. The self-test failed on 36. The one it passed was the field `Name`, which is the
+key that matches two fields, so it can never differ. The Esri behaviour each one
 relies on is cited under [Sources](#sources).
 
 **Datasets**
@@ -190,8 +210,8 @@ relies on is cited under [Sources](#sources).
 | Added | WIDENING | Nothing that exists today reads it. |
 | Type, as in table to feature class | BREAKING | A dataset's type is set when it is created. |
 | Moved to another feature dataset | BREAKING | Its catalog path changes. |
-| `ShapeType`, `HasZ`, `HasM`, `FeatureType` | BREAKING | Esri sets these when the feature class is created [5]. xwddiff knows no tool that changes them in place. |
-| Spatial reference: WKID, type, tolerance, resolution or origin | BREAKING | Define Projection only relabels the coordinate system [4]. A real change means Project into a new feature class. |
+| `ShapeType`, `HasZ`, `HasM`, `FeatureType` | BREAKING | A feature class holds one geometry type [5]. xwddiff knows no tool that changes these in place. |
+| Spatial reference: WKID, type, tolerance, scale or origin | BREAKING | Resolution and tolerance are defined when the feature class is created [5]. Define Projection only relabels the coordinate system [4]. |
 | `SubtypeFieldName` | BREAKING | Every row's subtype is now read from a different field. |
 | `DefaultSubtypeCode` | WIDENING | Only rows written from now on are affected. |
 | `AliasName`, `ModelName` | COSMETIC | Only the label changes. |
@@ -250,7 +270,9 @@ its domain, and only the domain name is read from that copy.
 
 **Everything else.** Any other element that differs, on a dataset, a field, a subtype or a domain,
 is BREAKING with the words `xwddiff has no rule for this element`. A relationship class is compared
-this way. So is any element that a newer ArcGIS release adds to the format.
+this way. So is any element that a newer ArcGIS release adds to the format. This does not reach a
+coded value or an index. Only the code and name of a coded value are read, and only the fields and
+uniqueness of an index.
 
 **Ignored on purpose.** These dataset elements change between two exports of one schema, or are
 compared somewhere else:
@@ -273,10 +295,10 @@ slightly different WKT text by different releases. Numbers compare by value, so 
 |---|---|
 | 0 | Identical, or COSMETIC changes only. |
 | 1 | At least one BREAKING change. |
-| 2 | A document could not be read, or `--out` could not be written. |
+| 2 | A document could not be read, or `--out` could not be written. Also: nothing was compared, the XML is not well formed, or it is nested too deeply. |
 | 3 | Refused. A name in a document stands for two things, so nothing was compared. |
 | 4 | WIDENING is the worst change. |
-| 64 | Usage error, including an abbreviated flag. |
+| 64 | Usage error, including an abbreviated flag and an `--out` that names `OLD` or `NEW`. |
 
 Exit 4 is not 0 on purpose. A widening change still needs a migration step somebody runs. A job
 that wants to pass widening changes can test for `1` alone.
@@ -290,30 +312,62 @@ that a file could not be read or written.
   a length or nullability, so some BREAKING changes are possible in place there.
 - It reads only what the XML says. It does not open a geodatabase, so it cannot count rows or
   find the values that a new domain or a shorter field would reject.
+- Only datasets and domains are compared. A change to `WorkspaceType`, `Version` or the data
+  section prints nothing and exits 0. Datasets must sit under `DatasetDefinitions`, and domains
+  under `Domains`, each directly under `WorkspaceDefinition`.
 - Names match exactly after the database and owner are removed. A rename is reported as a removal
-  and an addition, and so is a change of case only, such as `Shape` and `SHAPE`.
+  and an addition, and so is a change of case only, such as `Shape` and `SHAPE`. Domain names and
+  index column names also match case-sensitively. I did not check whether the geodatabase treats
+  two such names as one.
 - An export from a file geodatabase and one from an enterprise geodatabase can differ in system
   fields, precision and scale for the same schema. Those differences are reported. Compare two
   exports from the same kind of geodatabase when you can.
+- Two exports of one schema from different ArcGIS releases can differ in `LatestWKID`, `VCSWKID` or
+  the digits of a tolerance. Those report as BREAKING, which can be a false alarm. I found this
+  by reading the code, and did not run it.
+- A change to `Editable`, `DomainFixed`, `IsSystem` or another field element with no rule reports
+  BREAKING. That can be a false alarm. It is the safe direction.
 - The GlobalID rule relies on the Add Global IDs page not restricting it to empty tables. The page
   does not say in words that existing rows receive values.
 - Attribute rules, contingent values, topologies, networks and other controller datasets are not
   classified one by one. A difference in them is reported as BREAKING with no rule.
 - Field order is not compared. Index uniqueness is compared, and index sort order is not.
-- It reads the whole document into memory. Export with `SCHEMA_ONLY`. An export that includes data
-  can be very large, and the data section is never read.
+- A domain taken off a field inside one subtype is reported as WIDENING, because the field accepts
+  any value again. The tool does not check whether the field still carries a domain of its own.
+  If it does, and that domain is stricter, the real effect can be BREAKING. I did not check how
+  Esri falls back from a subtype to a field domain.
+- A leaf is compared as a number when both sides parse as one. A text default of `1` and `1.0`
+  count as the same default, and so do `007` and `7`. Two range bounds beyond 2^53 that differ
+  only in their last digits also compare equal.
+- A `nan` or `inf` in a bound or a length is not a number to this tool. A bound that changes to one
+  is BREAKING with no rule. Other odd formats, such as `1_0`, are read as Python reads them.
+- Date range bounds are not compared as dates. Any change to one is BREAKING.
+- `IsNullable` is compared without regard to case. An added field whose `IsNullable` is missing,
+  or is any text but `false`, counts as nullable.
+- A WKID decides the coordinate system on its own, so two custom systems that share WKID 0 are not
+  told apart by their WKT. I could not confirm that Esri writes WKID 0 for a custom system.
+- `ModelName` is classed COSMETIC. I did not check whether it maps to a physical column name, so
+  that rule is unverified.
+- It parses the whole document into memory, and never compares the data section. Export with
+  `SCHEMA_ONLY`. An export that includes data can be very large.
 - It does not open the `.zip` or `.z` file that the export tool writes when the output name ends
   that way [8]. It names a ZIP file as one and exits 2. Extract the `.xml` first.
 - It refuses any document that has a DOCTYPE. An XML workspace document does not need one, and a
   DTD is where entity-expansion attacks live [9]. The check runs in Expat before ElementTree
   parses anything, so a UTF-16 file is checked too.
+- A document nested more than about a thousand levels deep exits 2. So does one that uses a prefix
+  it never declares, and one that declares an encoding Python does not know. None ends in a
+  traceback.
+- `--out` is written in place, not through a temporary file and a rename. A full disk can leave a
+  partial file and exit 2. The tool refuses an `--out` that names `OLD` or `NEW`, but it
+  overwrites any other existing file when you pass `--apply`. Name a new file.
 - The rules come from Esri's documentation, not from runs against ArcGIS. No ArcGIS export was
   diffed during testing. The fixtures follow the element layout in Esri's technical paper [10].
 - `if __name__ == "__main__":` carries `# pragma: no branch`. Its false side is an import, which the
   self-test run never does. Every other branch is covered: 100% branch coverage of `xwddiff.py`
   under `coverage run --branch xwddiff.py --self-test`.
-- It writes nothing without `--apply`, and a refused run writes nothing at all. It never changes a
-  geodatabase, and it opens no socket.
+- It writes nothing without `--apply`, apart from the temporary directory of `--self-test`. A
+  refused run writes nothing at all. It never changes a geodatabase, and it opens no socket.
 
 ## Sources
 
@@ -325,8 +379,9 @@ that a file could not be read or written.
 3. Add Global IDs. <https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/add-global-ids.html>
 4. Define Projection: "it does not modify any geometry".
    <https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/define-projection.html>
-5. Feature class basics: the geometry type, the x,y tolerance and the resolution are defined when
-   the feature class is created.
+5. Feature class basics: each feature class holds features of one geometry type, and the x,y
+   resolution and tolerance "are defined during the creation of each feature class or feature
+   dataset".
    <https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/feature-class-basics.html>
 6. Introduction to attribute domains: "only the values within that domain are valid for the field."
    <https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/an-overview-of-attribute-domains.html>
